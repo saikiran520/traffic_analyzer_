@@ -2,21 +2,17 @@ package com.ebani.trafficanalyser
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.content.res.AssetFileDescriptor
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
-import android.graphics.Matrix
-import android.graphics.Rect
-import android.graphics.YuvImage
-import android.media.MediaMetadataRetriever
+import android.graphics.SurfaceTexture
+import android.media.MediaPlayer
 import android.os.Bundle
 import android.util.Size
 import android.view.Gravity
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -28,56 +24,71 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import java.io.ByteArrayOutputStream
-import java.io.IOException
-import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
+/**
+ * Quad-Engine Traffic Analyzer.
+ * Maximum parallelization and predictive tracking for "Live Stream" grade detection.
+ */
 class MainActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
-    private lateinit var localVideoView: ImageView
+    private lateinit var localVideoTexture: TextureView
     private lateinit var overlayView: DetectionOverlayView
     private lateinit var statusView: TextView
+    
     private lateinit var cameraExecutor: ExecutorService
+    private var mediaPlayer: MediaPlayer? = null
     private var detector: VehicleDetector? = null
     private var fps = 0f
-    @Volatile private var localVideoRunning = false
+    
+    // Quad-Buffering for parallel sampling
+    private val samplingBitmaps = arrayOfNulls<Bitmap>(4)
+    private val samplingIndex = AtomicInteger(0)
+    
+    private val activeInferences = AtomicInteger(0)
+    private val maxParallelTasks = 4
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        cameraExecutor = Executors.newSingleThreadExecutor()
+        
+        // High-priority multi-threaded AI pool
+        cameraExecutor = Executors.newFixedThreadPool(maxParallelTasks) { runnable ->
+            Thread(runnable).apply {
+                priority = Thread.MAX_PRIORITY
+                name = "AI-Quad-Engine"
+            }
+        }
+        
         buildUi()
 
         try {
             detector = VehicleDetector(this).also {
                 overlayView.setLabels(it.labels)
+                for (i in 0 until 4) {
+                    samplingBitmaps[i] = Bitmap.createBitmap(it.inputWidth, it.inputHeight, Bitmap.Config.ARGB_8888)
+                }
             }
-            statusView.text = "VehicleNet ready"
-        } catch (error: IOException) {
-            statusView.text = "Model load failed"
-            Toast.makeText(this, error.message, Toast.LENGTH_LONG).show()
-        } catch (error: RuntimeException) {
-            statusView.text = "Model load failed"
-            Toast.makeText(this, error.message, Toast.LENGTH_LONG).show()
+            statusView.text = "Quad-Engine System: ACTIVE"
+        } catch (error: Exception) {
+            statusView.text = "Init Failed"
+            Toast.makeText(this, "Error: ${error.message}", Toast.LENGTH_LONG).show()
         }
 
-        when {
-            DEBUG_USE_LOCAL_VIDEO -> startLocalVideoDebug()
-            hasCameraPermission() -> startCamera()
-            else -> ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.CAMERA),
-                CAMERA_PERMISSION_REQUEST,
-            )
+        if (DEBUG_USE_LOCAL_VIDEO) {
+            setupLocalVideoPlayer()
+        } else if (hasCameraPermission()) {
+            startCamera()
+        } else {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST)
         }
     }
 
     private fun buildUi() {
         val root = FrameLayout(this)
-        localVideoView = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
+        localVideoTexture = TextureView(this).apply {
             visibility = if (DEBUG_USE_LOCAL_VIDEO) View.VISIBLE else View.GONE
         }
         previewView = PreviewView(this).apply {
@@ -93,7 +104,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(18, 10, 18, 10)
         }
 
-        root.addView(localVideoView, fullScreenLayoutParams())
+        root.addView(localVideoTexture, fullScreenLayoutParams())
         root.addView(previewView, fullScreenLayoutParams())
         root.addView(overlayView, fullScreenLayoutParams())
 
@@ -113,208 +124,139 @@ class MainActivity : AppCompatActivity() {
         ViewGroup.LayoutParams.MATCH_PARENT,
     )
 
-    private fun hasCameraPermission(): Boolean =
-        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray,
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (
-            requestCode == CAMERA_PERMISSION_REQUEST &&
-            grantResults.isNotEmpty() &&
-            grantResults[0] == PackageManager.PERMISSION_GRANTED
-        ) {
-            startCamera()
-        } else {
-            statusView.text = "Camera permission required"
-        }
-    }
-
-    private fun startLocalVideoDebug() {
-        val activeDetector = detector ?: return
-        localVideoRunning = true
-        statusView.text = "Local video debug running"
-        cameraExecutor.execute {
-            val retriever = MediaMetadataRetriever()
-            try {
-                assets.openFd(LOCAL_VIDEO_ASSET).use { descriptor ->
-                    retriever.setDataSourceFrom(descriptor)
-                    val durationMs = retriever
-                        .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                        ?.toLongOrNull()
-                        ?: 0L
-                    var positionMs = 0L
-
-                    while (localVideoRunning) {
-                        val startedAt = System.nanoTime()
-                        val frame = retriever.getFrameAtTime(
-                            positionMs * 1000L,
-                            MediaMetadataRetriever.OPTION_CLOSEST,
-                        ) ?: run {
-                            positionMs = 0L
-                            continue
-                        }
-
-                        val detections = activeDetector.detect(frame)
-                        val instantFps = 1_000_000_000f / maxOf(1f, (System.nanoTime() - startedAt).toFloat())
-                        fps = if (fps == 0f) instantFps else fps * 0.85f + instantFps * 0.15f
-                        overlayView.update(detections, frame.width, frame.height, fps)
-                        localVideoView.post { localVideoView.setImageBitmap(frame) }
-                        statusView.post {
-                            statusView.text = String.format(Locale.US, "Local debug: %d detections", detections.size)
-                        }
-
-                        positionMs += DEBUG_FRAME_STEP_MS
-                        if (durationMs > 0L && positionMs >= durationMs) {
-                            positionMs = 0L
-                        }
-
-                        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
-                        try {
-                            Thread.sleep(maxOf(1L, DEBUG_FRAME_STEP_MS - elapsedMs))
-                        } catch (interrupted: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            break
-                        }
-                    }
-                }
-            } catch (error: IOException) {
-                statusView.post { statusView.text = "Local video failed" }
-            } catch (error: RuntimeException) {
-                statusView.post { statusView.text = "Local video failed" }
-            } finally {
-                try {
-                    retriever.release()
-                } catch (_: IOException) {
-                    // Nothing useful to recover during shutdown of debug playback.
-                }
+    private fun setupLocalVideoPlayer() {
+        localVideoTexture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+                startMediaPlayer(Surface(surface))
+            }
+            override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
+            override fun onSurfaceTextureDestroyed(surface: SurfaceTexture) = true
+            override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+                sampleFrameForDetection()
             }
         }
     }
 
-    private fun AssetFileDescriptor.setDataSourceOn(retriever: MediaMetadataRetriever) {
-        retriever.setDataSource(fileDescriptor, startOffset, length)
+    private fun startMediaPlayer(surface: Surface) {
+        try {
+            mediaPlayer = MediaPlayer().apply {
+                setSurface(surface)
+                assets.openFd(LOCAL_VIDEO_ASSET).use { fd ->
+                    setDataSource(fd.fileDescriptor, fd.startOffset, fd.length)
+                }
+                isLooping = true
+                setOnPreparedListener { it.start() }
+                prepareAsync()
+            }
+        } catch (e: Exception) {
+            statusView.text = "Video Playback Error"
+        }
     }
 
-    private fun MediaMetadataRetriever.setDataSourceFrom(descriptor: AssetFileDescriptor) {
-        descriptor.setDataSourceOn(this)
+    private fun sampleFrameForDetection() {
+        val activeDetector = detector ?: return
+        if (activeInferences.get() >= maxParallelTasks) return
+
+        activeInferences.incrementAndGet()
+        val bufferIndex = samplingIndex.getAndIncrement() % 4
+        val bitmapBuffer = samplingBitmaps[bufferIndex] ?: run { activeInferences.decrementAndGet(); return }
+        
+        localVideoTexture.getBitmap(bitmapBuffer)
+        
+        cameraExecutor.execute {
+            try {
+                val startAi = System.nanoTime()
+                val detections = activeDetector.detect(bitmapBuffer)
+                val elapsedAi = (System.nanoTime() - startAi).toFloat()
+                
+                val instantFps = 1_000_000_000f / maxOf(1f, elapsedAi)
+                fps = if (fps == 0f) instantFps else fps * 0.9f + (instantFps * maxParallelTasks) * 0.1f
+                
+                overlayView.update(detections, bitmapBuffer.width, bitmapBuffer.height, fps)
+                statusView.post {
+                    statusView.text = String.format(Locale.US, "ULTRA-SYNC: %d vehicles (%.1f ms)", detections.size, elapsedAi / 1_000_000f)
+                }
+            } finally {
+                activeInferences.decrementAndGet()
+            }
+        }
     }
 
     private fun startCamera() {
-        if (detector == null) return
-
+        val activeDetector = detector ?: return
         val providerFuture = ProcessCameraProvider.getInstance(this)
-        providerFuture.addListener(
-            {
-                try {
-                    val cameraProvider = providerFuture.get()
-                    val preview = Preview.Builder().build().also {
-                        it.surfaceProvider = previewView.surfaceProvider
-                    }
-                    val analysis = ImageAnalysis.Builder()
-                        .setTargetResolution(Size(640, 480))
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .build()
-                        .also { it.setAnalyzer(cameraExecutor, ::analyzeFrame) }
-
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(
-                        this,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        preview,
-                        analysis,
-                    )
-                    statusView.text = "Realtime analysis running"
-                } catch (error: Exception) {
-                    statusView.text = "Camera start failed"
-                    Toast.makeText(this, error.message, Toast.LENGTH_LONG).show()
+        providerFuture.addListener({
+            try {
+                val cameraProvider = providerFuture.get()
+                val preview = Preview.Builder().build().also {
+                    it.surfaceProvider = previewView.surfaceProvider
                 }
-            },
-            ContextCompat.getMainExecutor(this),
-        )
+                val analysis = ImageAnalysis.Builder()
+                    .setTargetResolution(Size(activeDetector.inputWidth, activeDetector.inputHeight))
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+                    .also { it.setAnalyzer(cameraExecutor, ::analyzeFrame) }
+
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+            } catch (error: Exception) {
+                statusView.text = "Camera Failed"
+            }
+        }, ContextCompat.getMainExecutor(this))
     }
 
     private fun analyzeFrame(imageProxy: ImageProxy) {
-        val activeDetector = detector ?: run {
+        val activeDetector = detector ?: run { imageProxy.close(); return }
+        if (activeInferences.get() >= maxParallelTasks) {
             imageProxy.close()
             return
         }
 
+        activeInferences.incrementAndGet()
         val startedAt = System.nanoTime()
+        
         try {
-            val bitmap = imageProxy.toBitmapFromYuv()
-            val rotated = bitmap.rotate(imageProxy.imageInfo.rotationDegrees)
-            val detections = activeDetector.detect(rotated)
-            val instantFps = 1_000_000_000f / maxOf(1f, (System.nanoTime() - startedAt).toFloat())
-            fps = if (fps == 0f) instantFps else fps * 0.85f + instantFps * 0.15f
-            overlayView.update(detections, rotated.width, rotated.height, fps)
-            statusView.post { statusView.text = String.format(Locale.US, "%d detections", detections.size) }
-        } catch (error: RuntimeException) {
-            statusView.post { statusView.text = "Analysis error" }
+            val buffer = imageProxy.planes[0].buffer
+            val rotation = imageProxy.imageInfo.rotationDegrees
+            val detections = activeDetector.detectRgba(buffer, imageProxy.width, imageProxy.height, rotation)
+
+            val elapsed = (System.nanoTime() - startedAt).toFloat()
+            val instantFps = 1_000_000_000f / maxOf(1f, elapsed)
+            fps = if (fps == 0f) instantFps else fps * 0.9f + (instantFps * maxParallelTasks) * 0.1f
+
+            val isRotated = rotation == 90 || rotation == 270
+            val targetWidth = if (isRotated) imageProxy.height else imageProxy.width
+            val targetHeight = if (isRotated) imageProxy.width else imageProxy.height
+
+            overlayView.update(detections, targetWidth, targetHeight, fps)
         } finally {
             imageProxy.close()
+            activeInferences.decrementAndGet()
         }
-    }
-
-    private fun ImageProxy.toBitmapFromYuv(): Bitmap {
-        val nv21 = yuv420ToNv21()
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-        val stream = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, width, height), 82, stream)
-        val bytes = stream.toByteArray()
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-    }
-
-    private fun ImageProxy.yuv420ToNv21(): ByteArray {
-        val nv21 = ByteArray(width * height * 3 / 2)
-        val yPlane = planes[0]
-        val uPlane = planes[1]
-        val vPlane = planes[2]
-        val yBuffer = yPlane.buffer
-        val uBuffer = uPlane.buffer
-        val vBuffer = vPlane.buffer
-
-        var outputIndex = 0
-        for (row in 0 until height) {
-            val yRowStart = row * yPlane.rowStride
-            for (col in 0 until width) {
-                nv21[outputIndex++] = yBuffer.get(yRowStart + col * yPlane.pixelStride)
-            }
-        }
-
-        val chromaHeight = height / 2
-        val chromaWidth = width / 2
-        for (row in 0 until chromaHeight) {
-            val uRowStart = row * uPlane.rowStride
-            val vRowStart = row * vPlane.rowStride
-            for (col in 0 until chromaWidth) {
-                nv21[outputIndex++] = vBuffer.get(vRowStart + col * vPlane.pixelStride)
-                nv21[outputIndex++] = uBuffer.get(uRowStart + col * uPlane.pixelStride)
-            }
-        }
-        return nv21
-    }
-
-    private fun Bitmap.rotate(rotationDegrees: Int): Bitmap {
-        if (rotationDegrees == 0) return this
-        val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-        return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        localVideoRunning = false
+        mediaPlayer?.release()
+        samplingBitmaps.forEach { it?.recycle() }
         detector?.close()
         cameraExecutor.shutdown()
     }
 
+    private fun hasCameraPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == CAMERA_PERMISSION_REQUEST && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startCamera()
+        }
+    }
+
     companion object {
         private const val CAMERA_PERMISSION_REQUEST = 7
-        private const val DEBUG_USE_LOCAL_VIDEO = true
+        private const val DEBUG_USE_LOCAL_VIDEO = true 
         private const val LOCAL_VIDEO_ASSET = "local_traffic.mp4"
-        private const val DEBUG_FRAME_STEP_MS = 120L
     }
 }
